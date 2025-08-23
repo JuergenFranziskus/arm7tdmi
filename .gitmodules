@@ -1,0 +1,3 @@
+[submodule "ARM7TDMI"]
+	path = ARM7TDMI
+	url = https://github.com/SingleStepTests/ARM7TDMI.git
