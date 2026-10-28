@@ -1,6 +1,10 @@
 use serde::Deserialize;
 
-use crate::{AccessSize, Arm7TDMI, Bus, CycleType, core::{Core, Cpsr}, instruction::{Instruction, Operation, Register}};
+use crate::{
+    Arm7, Bus, Size,
+    core::{Core, Cpsr},
+    instruction::{Instr, print::format},
+};
 
 #[derive(Deserialize)]
 pub struct Test {
@@ -34,8 +38,7 @@ pub struct State {
     pub pipeline: [u32; 2],
 }
 
-#[derive(Deserialize)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Deserialize, Copy, Clone, Debug)]
 pub struct Transaction {
     pub kind: u8,
     pub size: u8,
@@ -45,66 +48,24 @@ pub struct Transaction {
     pub access: u8,
 }
 
-
-pub struct TestBus<'a> {
-    test: &'a Test,
-    trans: usize,
-}
-impl<'a> TestBus<'a> {
-    pub fn new(test: &'a Test) -> Self {
-        Self {
-            test,
-            trans: 0,
-        }
-    }
-
-    fn do_read(&self, addr: u32, size: AccessSize) -> u32 {
-        let trans = &self.test.transactions[self.trans];
-        if trans.addr != addr { panic!("Is {addr:0>8x}, should {:0>8x}", trans.addr); }
-        trans.data
-    }
-}
-impl<'a> Bus for TestBus<'a> {
-    fn cycle(&mut self, addr: u32, data: u32, size: AccessSize, ty: CycleType, rw: bool, cpu: &Arm7TDMI) -> u32 {
-        if ty == CycleType::Internal { return addr; }
-
-        let seq = ty == CycleType::Sequential;
-
-        let data = if rw {
-            self.do_read(addr, size)
-        }
-        else {
-            data  
-        };
-        print_debug(cpu, addr, Some(data), Some(rw), Some(size), ty);
-        verify_transaction(addr, data, rw, size, seq, &self.test, self.trans);
-        self.trans += 1;
-
-        data
-    }
-}
-
-
-
-pub fn run_test(test: &Test) {
+pub fn do_test(test: &Test) {
     let mut cpu = init_cpu(test);
-    let mut bus = TestBus::new(test);
+    let mut bus = TestBus {
+        test,
+        transaction: 0,
 
-    let (_, instr) = cpu.curr_instr();
+        instr: None,
+        ignore_c: false,
+        ignore_v: false,
+    };
 
-    print_start_debug(&cpu);
-    cpu.run(&mut bus);
+    cpu.exec(&mut bus);
 
-    {
-        verify_end(&cpu, &test.end);
-        if bus.trans < test.transactions.len() {
-            eprintln!("Did not consume all {} transactions, only {}", test.transactions.len(), bus.trans);
-            panic!();
-        }
-    }
+    check_end(&cpu, &bus, test, bus.transaction);
 }
-fn init_cpu(test: &Test) -> Arm7TDMI {
+fn init_cpu(test: &Test) -> Arm7 {
     let start = &test.start;
+
     let core = Core {
         regs: start.regs,
         regs_fiq: start.regs_fiq,
@@ -120,216 +81,368 @@ fn init_cpu(test: &Test) -> Arm7TDMI {
         spsr_und: Cpsr(start.spsr[4]),
     };
 
-    Arm7TDMI::init_test(core, start.pipeline, test.base_addr)
+    Arm7::new(core, start.pipeline)
 }
-fn verify_transaction(addr: u32, data: u32, rw: bool, size: AccessSize, seq: bool, test: &Test, i: usize) -> bool {
-    let t = &test.transactions[i];
+fn check_end(cpu: &Arm7, bus: &TestBus, test: &Test, transaction: usize) {
+    let end = &test.end;
+
+    let core = &cpu.core;
     let mut err = false;
 
-
-    let is_size = match size {
-        AccessSize::Byte => 1,
-        AccessSize::Half => 2,
-        AccessSize::Word => 4,
-    };
-    let should_size = t.size;
-    if is_size != should_size {
-        err = true;
-        eprintln!("Access size does not match for cycle {}, should {should_size}, is {is_size}", t.cycle);
-    }
-
-    let is_addr = addr;
-    let should_addr = t.addr;
-    if is_addr != should_addr {
-        err = true;
-        eprintln!("Address bus does not match for cycle {}, should {should_addr:0>8x}, is {is_addr:0>8x}", t.cycle);
-    }
-
-    let is_data = data;
-    let should_data = t.data;
-    if is_data != should_data {
-        err = true;
-        eprintln!("Data bus does not match for cycle {}, should {should_data:0>8x}, is {is_data:0>8x}", t.cycle);
-    }
-
-    // let is_kind = if rw { 1 } else { 2 };
-    // let should_kind = t.kind & 0x3;
-    // if is_kind != should_kind {
-        // err = true;
-        // eprintln!("Access kind does not match for cycle {}, should {should_kind}, is {is_kind}", t.cycle);
-    // }
-
-    // let is_sequential = if bus.cycle_type == CycleType::Sequential { true } else { false };
-    // let should_sequential = t.access & 1 != 0;
-    // if is_sequential != should_sequential {
-        // err = true;
-        // eprintln!("Sequentiality does not match for cycle {}, should {should_sequential}, is {is_sequential}", t.cycle);
-    // }
-
-
-    if err { panic!() };
-
-    true
-}
-fn verify_end(cpu: &Arm7TDMI, end: &State) {
-    let mut err = false;
-    let core = cpu.core();
-    for (i, (is, should)) in core.regs.iter().copied().zip(end.regs.iter().copied()).enumerate() {
-        if is != should {
-            err = true;
-            eprintln!("R{i} does not match, is {is:0>8x}, should {should:0>8x}");
-        }
-    }
-
-    for (i, (is, should)) in core.regs_irq.iter().copied().zip(end.regs_irq.iter().copied()).enumerate() {
-        if is != should {
-            err = true;
-            eprintln!("IRQ R{i} does not match, is {is:0>8x}, should {should:0>8x}");
-        }
-    }
-    for (i, (is, should)) in core.regs_abt.iter().copied().zip(end.regs_abt.iter().copied()).enumerate() {
-        if is != should {
-            err = true;
-            eprintln!("ABT R{i} does not match, is {is:0>8x}, should {should:0>8x}");
-        }
-    }
-    for (i, (is, should)) in core.regs_svc.iter().copied().zip(end.regs_svc.iter().copied()).enumerate() {
-        if is != should {
-            err = true;
-            eprintln!("SVC R{i} does not match, is {is:0>8x}, should {should:0>8x}");
-        }
-    }
-    for (i, (is, should)) in core.regs_und.iter().copied().zip(end.regs_und.iter().copied()).enumerate() {
-        if is != should {
-            err = true;
-            eprintln!("UND R{i} does not match, is {is:0>8x}, should {should:0>8x}");
-        }
-    }
-    for (i, (is, should)) in core.regs_fiq.iter().copied().zip(end.regs_fiq.iter().copied()).enumerate() {
-        if is != should {
-            err = true;
-            eprintln!("FIQ R{i} does not match, is {is:0>8x}, should {should:0>8x}");
-        }
-    }
-
-    let is_cpsr = core.cpsr;
-    let should_cpsr = Cpsr(end.cpsr);
-    if is_cpsr != should_cpsr {
-        err = true;
-        eprintln!("CPSR does not match, is {is_cpsr} / {:0>8x}, should {should_cpsr} / {:0>8x}", is_cpsr.0, should_cpsr.0);
-    }
-
-
-    for i in 0..2 {
-        let is_pipe = cpu.pipeline[i];
-        let should_pipe = end.pipeline[i];
-        if is_pipe != should_pipe {
-            err = true;
-            eprintln!("Pipeline[{i}] does not match, is {is_pipe:0>8x}, should {should_pipe:0>8x}");
-        }
-    }
-
-
-
-    if err { panic!(); }
-}
-
-
-const DEBUG: bool = true;
-fn print_start_debug(cpu: &Arm7TDMI) {
-    if !DEBUG { return; }
-
-    print!("    ");
     for i in 0..16 {
-        print!("R{i:0>2}     = {:0>8x}", cpu.core.regs[i]);
-        if i != 7 && i != 15 {
-            print!(", ");
-        }
-        if i == 7 {
-            print!("\n    ");
+        if core.regs[i] != end.regs[i] {
+            eprintln!(
+                "R{i} does not match, should {:0>8x}, is {:0>8x}",
+                end.regs[i], core.regs[i]
+            );
+            err = true;
         }
     }
-    print!("\n    ");
     for i in 0..7 {
-        print!("R{:0>2}_fiq = {:0>8x}", i + 8, cpu.core.regs_fiq[i]);
-        if i != 6 {
-            print!(", ");
+        if core.regs_fiq[i] != end.regs_fiq[i] {
+            eprintln!(
+                "R{}_fiq does not match, should {:0>8x}, is {:0>8x}",
+                i + 8,
+                end.regs_fiq[i],
+                core.regs_fiq[i]
+            );
+            err = true;
         }
     }
-    print!("\n    ");
+    for i in 0..2 {
+        if core.regs_svc[i] != end.regs_svc[i] {
+            eprintln!(
+                "R{}_svc does not match, should {:0>8x}, is {:0>8x}",
+                i + 13,
+                end.regs_svc[i],
+                core.regs_svc[i]
+            );
+            err = true;
+        }
+    }
+    for i in 0..2 {
+        if core.regs_abt[i] != end.regs_abt[i] {
+            eprintln!(
+                "R{}_abt does not match, should {:0>8x}, is {:0>8x}",
+                i + 13,
+                end.regs_abt[i],
+                core.regs_abt[i]
+            );
+            err = true;
+        }
+    }
+    for i in 0..2 {
+        if core.regs_irq[i] != end.regs_irq[i] {
+            eprintln!(
+                "R{}_irq does not match, should {:0>8x}, is {:0>8x}",
+                i + 13,
+                end.regs_irq[i],
+                core.regs_irq[i]
+            );
+            err = true;
+        }
+    }
+    for i in 0..2 {
+        if core.regs_und[i] != end.regs_und[i] {
+            eprintln!(
+                "R{}_und does not match, should {:0>8x}, is {:0>8x}",
+                i + 13,
+                end.regs_und[i],
+                core.regs_und[i]
+            );
+            err = true;
+        }
+    }
+
+    let psrs = [
+        (core.cpsr, Cpsr(end.cpsr), "CPSR"),
+        (core.spsr_fiq, Cpsr(end.spsr[0]), "SPSR_fiq"),
+        (core.spsr_svc, Cpsr(end.spsr[1]), "SPSR_svc"),
+        (core.spsr_abt, Cpsr(end.spsr[2]), "SPSR_abt"),
+        (core.spsr_irq, Cpsr(end.spsr[3]), "SPSR_irq"),
+        (core.spsr_und, Cpsr(end.spsr[4]), "SPSR_und"),
+    ];
+
+    let c_mask = if bus.ignore_c { !(1 << 29) } else { !0 };
+    let v_mask = if bus.ignore_v { !(1 << 28) } else { !0 };
+    let mask = c_mask & v_mask;
+
+    for (is, should, name) in psrs {
+        if is.0 & mask != should.0 & mask {
+            eprintln!("{name} does not match, should {should}, is {is}");
+            err = true;
+        }
+    }
+
+    if transaction < test.transactions.len() {
+        eprintln!(
+            "Not all transactions have been consumed, has {}, used {}",
+            test.transactions.len(),
+            transaction
+        );
+        err = true;
+    }
 
     for i in 0..2 {
-        print!("R{:0>2}_irq = {:0>8x}", i + 13, cpu.core.regs_irq[i]);
-        if i != 1 {
-            print!(", ");
+        if cpu.pipe[i].0 != end.pipeline[i] {
+            eprintln!(
+                "Pipeline[{i}] does not match, should {:0>8x}, is {:0>8x}",
+                end.pipeline[i], cpu.pipe[i].0
+            );
+            err = true;
         }
     }
-    print!("\n    ");
 
-    for i in 0..2 {
-        print!("R{:0>2}_svc = {:0>8x}", i + 13, cpu.core.regs_svc[i]);
-        if i != 1 {
-            print!(", ");
-        }
+    if err {
+        panic!("Final state does not match");
     }
-    print!("\n    ");
-
-    for i in 0..2 {
-        print!("R{:0>2}_abt = {:0>8x}", i + 13, cpu.core.regs_abt[i]);
-        if i != 1 {
-            print!(", ");
-        }
-    }
-    print!("\n    ");
-
-    for i in 0..2 {
-        print!("R{:0>2}_und = {:0>8x}", i + 13, cpu.core.regs_und[i]);
-        if i != 1 {
-            print!(", ");
-        }
-    }
-    println!();
-
-
-
-    let (addr, instr) = cpu.curr_instr();
-
-    let disasm = super::instruction::print::format(instr, Some(cpu.core()), Some(addr));
-    println!("{addr:0>8x} {disasm}");
 }
-fn print_debug(cpu: &Arm7TDMI, addr: u32, data: Option<u32>, rw: Option<bool>, size: Option<AccessSize>, cycle_ty: CycleType) {
-    if !DEBUG { return; }
 
-    print!("    ");
+struct TestBus<'a> {
+    test: &'a Test,
+    transaction: usize,
 
-    let ty = match cycle_ty {
-        CycleType::Internal => "I",
-        CycleType::NonSequential => "N",
-        CycleType::Sequential => "S",
+    instr: Option<Instr>,
+    ignore_c: bool,
+    ignore_v: bool,
+}
+impl<'a> TestBus<'a> {
+    fn handle_access(
+        &mut self,
+        addr: u32,
+        data: u32,
+        rw: bool,
+        size: Size,
+        opc: bool,
+        seq: bool,
+        lock: bool,
+    ) -> u32 {
+        if rw && opc {
+            self.handle_opcode_access(addr, data, size, seq)
+        } else {
+            self.handle_transaction(addr, data, rw, size, opc, seq, lock)
+        }
+    }
+    fn handle_opcode_access(&mut self, addr: u32, data: u32, size: Size, seq: bool) -> u32 {
+        if self.test.transactions[self.transaction].addr == addr {
+            self.handle_transaction(addr, data, true, size, true, seq, false)
+        } else if addr == self.test.base_addr {
+            self.test.opcode
+        } else {
+            addr
+        }
+    }
+    fn handle_transaction(
+        &mut self,
+        addr: u32,
+        data: u32,
+        rw: bool,
+        size: Size,
+        opc: bool,
+        seq: bool,
+        lock: bool,
+    ) -> u32 {
+        let trans = &self.test.transactions[self.transaction];
+        self.transaction += 1;
+
+        let mut err = false;
+        let data = if trans.kind == 2 { data } else { trans.data };
+
+        let should_rw = trans.kind != 2;
+        let is_size = match size {
+            Size::Byte => 1,
+            Size::Half => 2,
+            Size::Word => 4,
+        };
+        let should_opc = trans.kind == 0;
+        //let should_seq = trans.access & 1 != 0;
+        let _ = seq;
+        let should_lock = trans.access & 8 != 0;
+
+        if addr != trans.addr {
+            eprintln!(
+                "ADDR does not match, should {:0>8x}, is {addr:0>8x}",
+                trans.addr
+            );
+            err = true;
+        }
+        if data != trans.data {
+            eprintln!(
+                "DATA does not match, should {:0>8x}, is {data:0>8x}",
+                trans.data
+            );
+            err = true;
+        }
+        if rw != should_rw {
+            eprintln!("RW   does not match, should {should_rw}, is {rw}");
+            err = true;
+        }
+        if is_size != trans.size {
+            eprintln!("SIZE does not match, should {}, is {is_size}", trans.size);
+            err = true;
+        }
+        if opc != should_opc {
+            eprintln!("OPC  does not match, should {should_opc}, is {opc}");
+            err = true;
+        }
+        //if seq != should_seq {
+        //    eprintln!("SEQ  does not match, should {should_seq}, is {seq}");
+        //    err = true;
+        //}
+        if lock != should_lock {
+            eprintln!("LOCK does not match, should {should_lock}, is {lock}");
+            err = true;
+        }
+
+        if err {
+            panic!("Bus did not match");
+        }
+
+        data
+    }
+}
+impl<'a> Bus for TestBus<'a> {
+    fn access(
+        &mut self,
+        addr: u32,
+        data: u32,
+        rw: bool,
+        size: Size,
+        opc: bool,
+        seq: bool,
+        lock: bool,
+    ) -> u32 {
+        let data = if size == Size::Byte && !rw {
+            data & 0xFF
+        } else if size == Size::Half && !rw {
+            data & 0xFFFF
+        } else {
+            data
+        };
+
+        let data = self.handle_access(addr, data, rw, size, opc, seq, lock);
+        let lo = addr & 3;
+        let rot = lo * 8;
+        if size == Size::Byte && rw {
+            data.rotate_left(rot)
+        } else if size == Size::Half && rw {
+            data.rotate_left(rot)
+        } else {
+            data
+        }
+    }
+
+    fn io(&mut self, addr: u32) {
+        let _ = addr;
+    }
+
+    fn dbg_start_instr(&mut self, instr: Instr, addr: u32, core: &Core) {
+        let _ = addr;
+        let _ = core;
+        self.instr = Some(instr);
+    }
+
+    fn dbg_load(
+        &mut self,
+        core: &Core,
+        addr: u32,
+        data: u32,
+        size: Size,
+        opc: bool,
+        seq: bool,
+        lock: bool,
+    ) {
+        let _ = core;
+        print_dbg(
+            self.instr.take(),
+            addr,
+            data,
+            size,
+            true,
+            seq,
+            lock,
+            opc,
+            true,
+        );
+    }
+
+    fn dbg_store(&mut self, core: &Core, addr: u32, data: u32, size: Size, seq: bool, lock: bool) {
+        let _ = core;
+        print_dbg(
+            self.instr.take(),
+            addr,
+            data,
+            size,
+            true,
+            seq,
+            lock,
+            false,
+            false,
+        );
+    }
+
+    fn dbg_io(&mut self, core: &Core, addr: u32) {
+        let _ = core;
+        print_dbg(
+            self.instr.take(),
+            addr,
+            0,
+            Size::Word,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+    }
+
+    fn dbg_c_unpredictable(&mut self) {
+        self.ignore_c = true;
+    }
+
+    fn dbg_v_unpredictable(&mut self) {
+        self.ignore_v = true;
+    }
+}
+
+fn print_dbg(
+    instr: Option<Instr>,
+    addr: u32,
+    data: u32,
+    size: Size,
+    mreq: bool,
+    seq: bool,
+    lock: bool,
+    opc: bool,
+    rw: bool,
+) {
+    let instr = if let Some(instr) = instr {
+        format(instr, None, None)
+    } else {
+        String::new()
     };
 
-    let rw = match rw {
-        Some(false) => "w",
-        Some(true) => "R",
-        None => " ",
+    let data = if mreq {
+        format!("{data:0>8x}")
+    } else {
+        String::new()
     };
-    let addr = addr;
-    let data = data.map(|d| format!("{d:0>8x}")).unwrap_or(String::from("        "));
     let size = match size {
-        Some(AccessSize::Byte) => "B",
-        Some(AccessSize::Half) => "H",
-        Some(AccessSize::Word) => "W",
-        None => " ",
+        Size::Byte => "BYTE",
+        Size::Half => "HALF",
+        Size::Word => "WORD",
     };
-    print!("{ty}{size} {addr:0>8x} {rw} {data}        ");
+    let size = if mreq { size } else { "    " };
+    let seq = if mreq && seq { "SEQ" } else { "   " };
+    let lock = if mreq && lock { "LOCK" } else { "    " };
+    let opc = if mreq && rw && opc { "OPC" } else { "   " };
+    let kind = if mreq && rw {
+        "LD"
+    } else if mreq {
+        "ST"
+    } else {
+        "IO"
+    };
 
-    let core = cpu.core();
-    let cpsr = core.cpsr;
-
-    let spsr = core.spsr();
-
-    print!("{cpsr} {:?} / {spsr} {:?}", cpsr.mode(), spsr.mode());
-
-
-    println!();
+    println!("{instr:<30}{opc} {addr:0>8x} {seq} {kind} {size} {data} {lock}");
 }

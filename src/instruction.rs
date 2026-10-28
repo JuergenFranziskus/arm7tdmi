@@ -3,14 +3,19 @@ use std::io::{self, Write};
 pub mod print;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Instruction {
-    pub condition: Condition,
-    pub operation: Operation,
+pub struct Instr {
+    pub cc: Cc,
+    pub op: Op,
+}
+impl Instr {
+    pub const NOP: Self = Self {
+        cc: Cc::Always,
+        op: Op::Nop,
+    };
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Condition {
+pub enum Cc {
     Equal,
     NotEqual,
     UnsignedHigherOrSame,
@@ -28,9 +33,9 @@ pub enum Condition {
     Always,
     Reserved,
 }
-impl Condition {
+impl Cc {
     pub fn pretty_print(self, out: &mut impl Write) -> io::Result<()> {
-        use Condition::*;
+        use Cc::*;
         match self {
             Equal => write!(out, "EQ")?,
             NotEqual => write!(out, "NE")?,
@@ -55,44 +60,47 @@ impl Condition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Operation {
-    Bx(Register),
+pub enum Op {
+    Bx(Reg),
     B(i32),
     Bl(i32),
     Data {
-        operation: DataOperation,
+        op: DataOp,
         s: bool,
-        rd: Register,
-        rn: Register,
-        operand2: Operand2,
+        rd: Reg,
+        rn: Reg,
+        op2: Op2,
     },
-    MoveFromCpsr(Register),
-    MoveFromSpsr(Register),
-    MoveToCpsr(CpsrFields, Operand2),
-    MoveToSpsr(CpsrFields, Operand2),
-    MoveToCpsrf(Operand2),
-    MoveToSpsrf(Operand2),
+    Mrs {
+        p: bool,
+        rd: Reg,
+    },
+    Msr {
+        p: bool,
+        fields: PsrFields,
+        op2: Op2,
+    },
     Mul {
         s: bool,
-        rd: Register,
-        rm: Register,
-        rs: Register,
+        rd: Reg,
+        rm: Reg,
+        rs: Reg,
     },
     Mla {
         s: bool,
-        rd: Register,
-        rm: Register,
-        rs: Register,
-        rn: Register,
+        rd: Reg,
+        rm: Reg,
+        rs: Reg,
+        rn: Reg,
     },
     Mull {
         s: bool,
         u: bool,
         a: bool,
-        rd_lo: Register,
-        rd_hi: Register,
-        rm: Register,
-        rs: Register,
+        rd_lo: Reg,
+        rd_hi: Reg,
+        rm: Reg,
+        rs: Reg,
     },
     Nop,
     WordTransfer {
@@ -101,9 +109,9 @@ pub enum Operation {
         b: bool,
         w: bool,
         l: bool,
-        rn: Register,
-        rd: Register,
-        offset: WordTransferOffset,
+        rn: Reg,
+        rd: Reg,
+        offset: WordOffset,
     },
     HalfwordTransfer {
         p: bool,
@@ -112,9 +120,9 @@ pub enum Operation {
         l: bool,
         s: bool,
         h: bool,
-        rn: Register,
-        rd: Register,
-        offset: HalfwordTransferOffset,
+        rn: Reg,
+        rd: Reg,
+        offset: HalfOffset,
     },
     BlockTransfer {
         p: bool,
@@ -122,49 +130,40 @@ pub enum Operation {
         s: bool,
         w: bool,
         l: bool,
-        rn: Register,
-        register_list: u16,
+        rn: Reg,
+        regs: u16,
     },
     Swap {
         b: bool,
-        rn: Register,
-        rd: Register,
-        rm: Register,
+        rn: Reg,
+        rd: Reg,
+        rm: Reg,
     },
     Swi,
-    CoprocessorData {
-        cp_operation: u8,
-        crn: Register,
-        crd: Register,
-        cp_number: u8,
-        cp: u8,
-        crm: Register,
+    Undefined,
+
+    HiRegOps {
+        op: HiRegOp,
+        rs: Reg,
+        rd: Reg,
     },
-    CoprocessorMemoryTransfer {
-        p: bool,
-        u: bool,
-        n: bool,
-        w: bool,
-        l: bool,
-        rn: Register,
-        crd: Register,
-        cp_number: u8,
+    LoadAddr {
+        sp: bool,
+        rd: Reg,
         offset: u8,
     },
-    CoprocessorRegisterTransfer {
-        l: bool,
-        cp_opc: u8,
-        crn: Register,
-        rd: Register,
-        cp_number: u8,
-        cp: u8,
-        crm: Register,
+    BranchLong {
+        h: bool,
+        offset: i32,
     },
-    Undefined,
+    LdrPc {
+        rd: Reg,
+        offset: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DataOperation {
+pub enum DataOp {
     And,
     Eor,
     Sub,
@@ -182,57 +181,80 @@ pub enum DataOperation {
     Bic,
     Mvn,
 }
-impl DataOperation {
+impl DataOp {
     pub fn has_result(self) -> bool {
-        use DataOperation::*;
+        use DataOp::*;
         !matches!(self, Cmp | Cmn | Teq | Tst)
     }
     pub fn is_unary(self) -> bool {
-        use DataOperation::*;
+        use DataOp::*;
         matches!(self, Mov | Mvn)
     }
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Register(pub u8);
-impl Register {
+pub struct Reg(pub u8);
+impl Reg {
     pub fn new(code: u8) -> Self {
         assert!(code < 0x10);
         Self(code)
     }
 
+    pub fn is_pc(self) -> bool {
+        self == Self::PC
+    }
+
+    pub const STACK: Self = Self(13);
     pub const LINK: Self = Self(14);
     pub const PC: Self = Self(15);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Operand2 {
+pub enum Op2 {
     Register(Shift),
     Immediate(u8, u8),
 }
-impl Operand2 {
+impl Op2 {
     pub fn has_register_shift(self) -> bool {
-        matches!(self, Self::Register(Shift { shift_count: ShiftCount::Register(_), .. }))
+        matches!(
+            self,
+            Self::Register(Shift {
+                shift_count: ShiftCount::Register(_),
+                ..
+            })
+        )
     }
-    pub fn is_register_shift(self, rs: Register) -> bool {
-        let Self::Register(shift) = self else { return false };
-        let ShiftCount::Register(reg) = shift.shift_count else { return false };
+    pub fn is_register_shift(self, rs: Reg) -> bool {
+        let Self::Register(shift) = self else {
+            return false;
+        };
+        let ShiftCount::Register(reg) = shift.shift_count else {
+            return false;
+        };
         rs == reg
     }
-    
-    pub fn uses_reg(self, pc: Register) -> bool {
-        let Self::Register(shift) = self else { return false };
+
+    pub fn uses_reg(self, pc: Reg) -> bool {
+        let Self::Register(shift) = self else {
+            return false;
+        };
         shift.rm == pc || shift.shift_count == ShiftCount::Register(pc)
+    }
+
+    pub fn register(reg: Reg) -> Op2 {
+        Self::Register(Shift {
+            rm: reg,
+            shift_type: ShiftType::LogicalLeft,
+            shift_count: ShiftCount::Constant(0),
+        })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shift {
-    pub rm: Register,
+    pub rm: Reg,
     pub shift_type: ShiftType,
     pub shift_count: ShiftCount,
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,51 +267,58 @@ pub enum ShiftType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShiftCount {
     Constant(u8),
-    Register(Register),
+    Register(Reg),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WordTransferOffset {
+pub enum WordOffset {
     Immediate(u16),
     Shift(Shift),
 }
-impl WordTransferOffset {
+impl WordOffset {
     pub fn uses_pc(self) -> bool {
-        let Self::Shift(shift) = self else { return false };
-        shift.rm == Register::PC || shift.shift_count == ShiftCount::Register(Register::PC)
+        let Self::Shift(shift) = self else {
+            return false;
+        };
+        shift.rm == Reg::PC || shift.shift_count == ShiftCount::Register(Reg::PC)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HalfwordTransferOffset {
-    Register(Register),
+pub enum HalfOffset {
+    Register(Reg),
     Immediate(u8),
 }
-impl HalfwordTransferOffset {
+impl HalfOffset {
     pub fn uses_pc(self) -> bool {
-        let Self::Register(rm) = self else { return false };
-        rm == Register::PC
+        let Self::Register(rm) = self else {
+            return false;
+        };
+        rm == Reg::PC
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CpsrFields {
-    pub c: bool,
+pub struct PsrFields {
     pub f: bool,
     pub s: bool,
     pub x: bool,
+    pub c: bool,
 }
-impl CpsrFields {
-    pub fn mask(self, user: bool) -> u32 {
-        let c = if self.c { 0xFF } else { 0 };
-        let x = if self.x { 0xFF00 } else { 0 };
-        let s = if self.s { 0xFF0000 } else { 0 };
+impl PsrFields {
+    pub(crate) fn mask(&self) -> u32 {
         let f = if self.f { 0xFF000000 } else { 0 };
-        if user {
-            f
-        }
-        else {
-            c | f | x | s
-        }
+        let s = if self.s { 0x00FF0000 } else { 0 };
+        let x = if self.x { 0x0000FF00 } else { 0 };
+        let c = if self.c { 0x000000FF } else { 0 };
+
+        f | s | x | c
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HiRegOp {
+    Add,
+    Cmp,
+    Mov,
 }
